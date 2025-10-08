@@ -13,6 +13,7 @@ RANK = int(os.environ.get("RANK", 0))
 DEVICE = torch.device("cuda", LOCAL_RANK) if torch.cuda.is_available() else torch.device("cpu")
 print(f"[RANK {RANK}] Using device {DEVICE}")
 
+
 # ------------------ Dataset ------------------
 class JsonlIterableDataset(IterableDataset):
     """
@@ -28,8 +29,7 @@ class JsonlIterableDataset(IterableDataset):
         self.block_size = block_size
         self.rank = rank
         self.world_size = world_size
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        self.pad_token_id = tokenizer.pad_token_id
         self.eos_token_id = tokenizer.eos_token_id
 
     def __iter__(self):
@@ -50,11 +50,11 @@ class JsonlIterableDataset(IterableDataset):
                     # 在块末尾加 eos_token
                     if len(chunk) >= self.block_size:
                         # 块满了，替换最后一个 token 为 eos_token
-                        chunk[-1] = self.eos_token_id
+                        chunk[-1] = self.pad_token_id
                         attention_mask = [1] * self.block_size
                     else:
                         # 添加 eos_token
-                        chunk.append(self.eos_token_id)
+                        chunk.append(self.pad_token_id)
                         attention_mask = [1] * len(chunk)
                         # 如果长度超过 block_size，需要 truncate
                         if len(chunk) > self.block_size:
@@ -72,14 +72,13 @@ class JsonlIterableDataset(IterableDataset):
                         'attention_mask': attention_mask
                     }
 
+
 # ------------------ Tokenizer & Model ------------------
-tokenizer = AutoTokenizer.from_pretrained("gpt2")
-tokenizer.pad_token = tokenizer.eos_token
+tokenizer = AutoTokenizer.from_pretrained("/home/jnu/jiananfu/project/GPT2/HuggingFace/minimind_tokenizer")
 
 model_config = GPT2Config(
-    vocab_size=len(tokenizer),
+    vocab_size=tokenizer.vocab_size,
     n_positions=512,
-    n_ctx=512,
     n_embd=768,
     n_layer=12,
     n_head=12
@@ -88,12 +87,21 @@ model = GPT2LMHeadModel(model_config).to(DEVICE)
 
 # ------------------ Dataset 实例 ------------------
 dataset = JsonlIterableDataset(
-    file_path="path_to_your_32GB.jsonl",
+    file_path="/home/jnu/jiananfu/project/GPT2/dataset/mobvoi_seq_monkey_general_open_corpus.jsonl",
     tokenizer=tokenizer,
     block_size=512,
     rank=RANK,
     world_size=WORLD_SIZE
 )
+
+# for i, batch in enumerate(dataset):
+#     # print(batch['input_ids'])
+#     print(len(batch['input_ids']))
+#     # print(tokenizer.decode(batch['input_ids']))
+#     if i == 99:
+#         print(tokenizer.decode(batch['input_ids']))
+#         break
+
 
 # ------------------ Data Collator ------------------
 def data_collator(batch):
@@ -103,22 +111,26 @@ def data_collator(batch):
         'attention_mask': torch.tensor([f['attention_mask'] for f in batch], dtype=torch.long)
     }
 
+
 # ------------------ TrainingArguments ------------------
 training_args = TrainingArguments(
-    output_dir="./gpt2_pretrain_output",
+    output_dir="model_save",
     overwrite_output_dir=True,
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=8,
+    per_device_train_batch_size=32,
+    gradient_accumulation_steps=2,
     fp16=True,
-    num_train_epochs=3,
-    save_steps=5000,
-    save_total_limit=5,
-    logging_steps=500,
+    num_train_epochs=1,
+    save_strategy="steps",
+    max_steps=60_000,
+    save_steps=1000,
+    save_total_limit=4,
+    logging_steps=200,
     report_to="tensorboard",
+    logging_dir="logs",
     dataloader_drop_last=True,
-    dataloader_num_workers=2,
+    dataloader_num_workers=8,
     ddp_find_unused_parameters=False,
-    run_name="GPT2_pretrain_eos"
+    run_name="GPT2_pretrain"
 )
 
 # ------------------ Trainer ------------------
@@ -126,7 +138,7 @@ trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=dataset,
-    tokenizer=tokenizer,
+    processing_class=tokenizer,
     data_collator=data_collator
 )
 
