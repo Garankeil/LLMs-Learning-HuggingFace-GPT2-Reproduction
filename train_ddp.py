@@ -1,133 +1,134 @@
+# train_gpt2_ddp_eos.py
+
 import os
-from torch.utils.data import IterableDataset, DataLoader
-from transformers import (
-    GPT2LMHeadModel, GPT2Config, AutoTokenizer, TrainingArguments, Trainer
-)
-from datasets import load_dataset
 import torch
+from transformers import GPT2LMHeadModel, GPT2Config, AutoTokenizer, Trainer, TrainingArguments
+from torch.utils.data import IterableDataset
+import json
 
 # ------------------ DDP 配置 ------------------
-def get_local_rank():
-    return int(os.environ.get("LOCAL_RANK", 0))
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
+WORLD_SIZE = int(os.environ.get("WORLD_SIZE", 1))
+RANK = int(os.environ.get("RANK", 0))
+DEVICE = torch.device("cuda", LOCAL_RANK) if torch.cuda.is_available() else torch.device("cpu")
+print(f"[RANK {RANK}] Using device {DEVICE}")
 
-def get_world_size():
-    return int(os.environ.get("WORLD_SIZE", 1))
-
-def get_rank():
-    return int(os.environ.get("RANK", 0))
-
-# ------------------ IterableDataset + DDP ------------------
-class HFIterableDatasetDDP(IterableDataset):
+# ------------------ Dataset ------------------
+class JsonlIterableDataset(IterableDataset):
     """
-    支持 DDP 的 IterableDataset，每个进程只处理自己的子序列
+    支持：
+    - 长文本分块（block_size）
+    - attention_mask
+    - 每块末尾加 eos_token，总长度保持 block_size
+    - DDP + 多worker切片
     """
-    def __init__(self, dataset_stream, rank=0, world_size=1):
-        self.dataset_stream = dataset_stream
+    def __init__(self, file_path, tokenizer, block_size=512, rank=0, world_size=1):
+        self.file_path = file_path
+        self.tokenizer = tokenizer
+        self.block_size = block_size
         self.rank = rank
         self.world_size = world_size
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        self.eos_token_id = tokenizer.eos_token_id
 
     def __iter__(self):
-        for idx, item in enumerate(self.dataset_stream):
-            if idx % self.world_size == self.rank:
-                yield item
+        worker_info = torch.utils.data.get_worker_info()
+        worker_id = worker_info.id if worker_info else 0
+        total_workers = worker_info.num_workers if worker_info else 1
 
-# ------------------ Tokenization ------------------
-def tokenize_batch(texts, tokenizer, max_length=512):
-    enc = tokenizer(
-        texts,
-        truncation=True,
-        padding="max_length",
-        max_length=max_length,
-        return_tensors="pt"
-    )
-    enc["labels"] = enc["input_ids"].clone()
-    return enc
+        with open(self.file_path, 'r', encoding='utf-8') as f:
+            for idx, line in enumerate(f):
+                if idx % (self.world_size * total_workers) != (self.rank * total_workers + worker_id):
+                    continue
+                data = json.loads(line.strip())
+                input_ids_full = self.tokenizer.encode(data['text'])
 
-# ------------------ Collate 函数 ------------------
-def collate_fn(batch):
-    texts = [x["text"] for x in batch]
-    return tokenize_batch(texts, tokenizer, max_length=512)
+                for i in range(0, len(input_ids_full), self.block_size):
+                    chunk = input_ids_full[i:i+self.block_size]
 
-# ------------------ 初始化 tokenizer & model ------------------
-tokenizer = AutoTokenizer.from_pretrained(
-    r"C:\PytorchCode\GPT2\learningLLMs\minimind_tokenizer"
-)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+                    # 在块末尾加 eos_token
+                    if len(chunk) >= self.block_size:
+                        # 块满了，替换最后一个 token 为 eos_token
+                        chunk[-1] = self.eos_token_id
+                        attention_mask = [1] * self.block_size
+                    else:
+                        # 添加 eos_token
+                        chunk.append(self.eos_token_id)
+                        attention_mask = [1] * len(chunk)
+                        # 如果长度超过 block_size，需要 truncate
+                        if len(chunk) > self.block_size:
+                            chunk = chunk[:self.block_size]
+                            attention_mask = [1] * self.block_size
+                        # pad 到 block_size
+                        if len(chunk) < self.block_size:
+                            pad_len = self.block_size - len(chunk)
+                            chunk += [self.tokenizer.pad_token_id] * pad_len
+                            attention_mask += [0] * pad_len
 
-config = GPT2Config(
-    vocab_size=tokenizer.vocab_size,
+                    yield {
+                        'input_ids': chunk,
+                        'labels': chunk.copy(),
+                        'attention_mask': attention_mask
+                    }
+
+# ------------------ Tokenizer & Model ------------------
+tokenizer = AutoTokenizer.from_pretrained("gpt2")
+tokenizer.pad_token = tokenizer.eos_token
+
+model_config = GPT2Config(
+    vocab_size=len(tokenizer),
     n_positions=512,
+    n_ctx=512,
     n_embd=768,
-    n_layers=8,
-    n_head=8,
-    eos_token_id=tokenizer.eos_token_id,
-    pad_token_id=tokenizer.pad_token_id,
+    n_layer=12,
+    n_head=12
 )
-model = GPT2LMHeadModel(config)
-# 同步 generation_config
-if hasattr(model, "generation_config"):
-    model.generation_config.eos_token_id = tokenizer.eos_token_id
-    model.generation_config.pad_token_id = tokenizer.pad_token_id
+model = GPT2LMHeadModel(model_config).to(DEVICE)
 
-# ------------------ 加载 JSONL 流式 dataset ------------------
-data_files = {
-    "train": [
-        r"C:\PytorchCode\GPT2\dataset\split_jsonl\part_0.jsonl",
-        r"C:\PytorchCode\GPT2\dataset\split_jsonl\part_1.jsonl",
-    ]
-}
-dataset = load_dataset(
-    'json',
-    data_files=data_files,
-    streaming=True,
-    split="train",
+# ------------------ Dataset 实例 ------------------
+dataset = JsonlIterableDataset(
+    file_path="path_to_your_32GB.jsonl",
+    tokenizer=tokenizer,
+    block_size=512,
+    rank=RANK,
+    world_size=WORLD_SIZE
 )
 
-# 获取 DDP rank / world_size
-local_rank = get_local_rank()
-rank = get_rank()
-world_size = get_world_size()
-
-train_data = HFIterableDatasetDDP(dataset, rank=rank, world_size=world_size)
+# ------------------ Data Collator ------------------
+def data_collator(batch):
+    return {
+        'input_ids': torch.tensor([f['input_ids'] for f in batch], dtype=torch.long),
+        'labels': torch.tensor([f['labels'] for f in batch], dtype=torch.long),
+        'attention_mask': torch.tensor([f['attention_mask'] for f in batch], dtype=torch.long)
+    }
 
 # ------------------ TrainingArguments ------------------
 training_args = TrainingArguments(
-    output_dir="model_save",
-    per_device_train_batch_size=8,  # 每张卡 batch_size，可以调节
-    gradient_accumulation_steps=32, # 累积步数，总全局 batch = 8*2*32=512
-    learning_rate=1e-4,
-    num_train_epochs=2,
-    logging_steps=50,
-    save_strategy='steps',
-    save_steps=500,
-    save_total_limit=2,
-    max_steps=20000,
+    output_dir="./gpt2_pretrain_output",
+    overwrite_output_dir=True,
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,
+    fp16=True,
+    num_train_epochs=3,
+    save_steps=5000,
+    save_total_limit=5,
+    logging_steps=500,
     report_to="tensorboard",
-    logging_dir="logs",
-    disable_tqdm=False,
-    fp16=True,                       # 混合精度
+    dataloader_drop_last=True,
+    dataloader_num_workers=2,
     ddp_find_unused_parameters=False,
-)
-
-# ------------------ DataLoader ------------------
-train_dataloader = DataLoader(
-    train_data,
-    batch_size=training_args.per_device_train_batch_size,
-    num_workers=18,          # CPU 核心数，可调
-    pin_memory=True,
-    collate_fn=collate_fn,
-    prefetch_factor=4
+    run_name="GPT2_pretrain_eos"
 )
 
 # ------------------ Trainer ------------------
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=train_data,
+    train_dataset=dataset,
     tokenizer=tokenizer,
-    data_collator=collate_fn
+    data_collator=data_collator
 )
 
-if __name__ == "__main__":
-    trainer.train()
+# ------------------ 开始训练 ------------------
+trainer.train()
