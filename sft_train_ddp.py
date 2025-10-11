@@ -60,11 +60,22 @@ model = get_peft_model(model, lora_config)
 model.print_trainable_parameters()
 
 
-# ------------------ 4. 数据集处理 (最终修正版) ------------------
+# ------------------ 4. 数据集处理 (最终的、基于边界的版本) ------------------
 class SFTDataset(Dataset):
     def __init__(self, file_path: str, tokenizer_d, max_length: int = 512):
         self.tokenizer = tokenizer_d
         self.max_length = max_length
+        
+        # 为了高效，我们在初始化时就获取边界标记的 token ID
+        # assistant 回答的开始，是由 user 回合的模板触发的
+        # 我们只取这个提示的最后一个 token 作为开始的信号
+        self.assistant_prompt_end_token_id = self.tokenizer.encode(
+            '<|im_start|>assistant\n', add_special_tokens=False
+        )[-1]
+        
+        # assistant 回答的结束标记
+        self.im_end_token_id = self.tokenizer.eos_token_id # 根据您的 tokenizer，<|im_end|> 就是 eos_token
+
         print(f"Loading data from {file_path}...")
         with open(file_path, 'r', encoding='utf-8') as f:
             self.data = [json.loads(line) for line in f]
@@ -77,44 +88,42 @@ class SFTDataset(Dataset):
         item = self.data[idx]
         conversations = item['conversations']
 
-        # 第一步：一次性将整个对话历史应用模板，生成完整的 input_ids
-        # 这是确保与模板逻辑完全一致的唯一正确方法
-        full_input_text = self.tokenizer.apply_chat_template(
+        # 第一步：一次性生成完整的 input_ids
+        input_ids = self.tokenizer.apply_chat_template(
             conversations,
-            tokenize=False,
-            add_generation_prompt=False  # 在训练时我们不需要末尾的 assistant 提示
+            tokenize=True, # 直接让模板返回 token IDs
+            add_special_tokens=False,
+            add_generation_prompt=False,
         )
-        input_ids = self.tokenizer.encode(full_input_text, add_special_tokens=False)
         
         # 第二步：初始化 labels，默认所有 token 都不计算损失
         labels = [-100] * len(input_ids)
-
-        # 第三步：精确定位并标记出 assistant 的回答部分
-        # 我们通过独立编码 assistant 的内容，然后在完整的 input_ids 中查找它
-        current_search_position = 0
-        for turn in conversations:
-            if turn['role'] == 'assistant':
-                # 只编码内容，不加任何特殊 token
-                assistant_content_ids = self.tokenizer.encode(turn['content'], add_special_tokens=False)
+        
+        # 第三步：基于边界标记，找到所有 assistant 的回答并标记 labels
+        current_position = 0
+        while current_position < len(input_ids):
+            try:
+                # 1. 寻找 assistant 回答的“开始”边界
+                # 我们寻找 user 回合末尾的那个 assistant 提示符
+                start_index = input_ids.index(self.assistant_prompt_end_token_id, current_position)
                 
-                # 在 input_ids 中查找这段 content_ids 的起始位置
-                # 我们从上一次找到的位置之后开始搜索，以处理多轮对话
-                try:
-                    start_index = input_ids.index(assistant_content_ids[0], current_search_position)
-                    
-                    # 验证这是否是一个真正的匹配
-                    if input_ids[start_index : start_index + len(assistant_content_ids)] == assistant_content_ids:
-                        # 找到了！现在我们用真实的 token_id 替换掉 labels 中对应位置的 -100
-                        labels[start_index : start_index + len(assistant_content_ids)] = assistant_content_ids
-                        
-                        # 更新下一次搜索的起始位置
-                        current_search_position = start_index + len(assistant_content_ids)
+                # assistant 的实际内容从这个提示符之后开始
+                content_start_index = start_index + 1
 
-                except ValueError:
-                    # 如果在 input_ids 中找不到 assistant 的第一个 token，说明数据可能有问题
-                    # 在这里可以添加一些日志或错误处理
-                    # print(f"Warning: Could not find assistant content in input_ids for item {idx}")
-                    pass
+                # 2. 寻找 assistant 回答的“结束”边界
+                # 从内容开始的位置，寻找第一个 <|im_end|>
+                end_index = input_ids.index(self.im_end_token_id, content_start_index)
+                
+                # 3. 标记证据
+                # 我们要学习的，就是从 content_start_index 到 end_index (包含) 的所有内容
+                labels[content_start_index : end_index + 1] = input_ids[content_start_index : end_index + 1]
+                
+                # 4. 更新下次搜寻的起点
+                current_position = end_index + 1
+                
+            except ValueError:
+                # 如果找不到更多的 assistant 回答边界，就跳出循环
+                break
 
         # 截断
         if len(input_ids) > self.max_length:
