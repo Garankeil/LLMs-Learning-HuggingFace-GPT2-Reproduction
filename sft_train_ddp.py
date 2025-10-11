@@ -60,21 +60,20 @@ model = get_peft_model(model, lora_config)
 model.print_trainable_parameters()
 
 
-# ------------------ 4. 数据集处理 (最终的、基于边界的版本) ------------------
+# ------------------ 4. 数据集处理 (最终的、由您修正思路的版本) ------------------
 class SFTDataset(Dataset):
     def __init__(self, file_path: str, tokenizer_d, max_length: int = 512):
         self.tokenizer = tokenizer_d
         self.max_length = max_length
         
-        # 为了高效，我们在初始化时就获取边界标记的 token ID
-        # assistant 回答的开始，是由 user 回合的模板触发的
-        # 我们只取这个提示的最后一个 token 作为开始的信号
-        self.assistant_prompt_end_token_id = self.tokenizer.encode(
+        # 准备“灯塔”信标 (完整的 token ID 序列)
+        # 这是 assistant 回答开始的、唯一的、结构化的标志
+        self.assistant_prompt_ids = self.tokenizer.encode(
             '<|im_start|>assistant\n', add_special_tokens=False
-        )[-1]
+        )
         
         # assistant 回答的结束标记
-        self.im_end_token_id = self.tokenizer.eos_token_id # 根据您的 tokenizer，<|im_end|> 就是 eos_token
+        self.im_end_token_id = self.tokenizer.eos_token_id
 
         print(f"Loading data from {file_path}...")
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -91,39 +90,45 @@ class SFTDataset(Dataset):
         # 第一步：一次性生成完整的 input_ids
         input_ids = self.tokenizer.apply_chat_template(
             conversations,
-            tokenize=True, # 直接让模板返回 token IDs
+            tokenize=True,
             add_special_tokens=False,
             add_generation_prompt=False,
         )
         
-        # 第二步：初始化 labels，默认所有 token 都不计算损失
+        # 第二步：初始化 labels
         labels = [-100] * len(input_ids)
         
-        # 第三步：基于边界标记，找到所有 assistant 的回答并标记 labels
+        # 第三步：使用健壮的子序列查找来定位所有 assistant 的回答
         current_position = 0
         while current_position < len(input_ids):
-            try:
-                # 1. 寻找 assistant 回答的“开始”边界
-                # 我们寻找 user 回合末尾的那个 assistant 提示符
-                start_index = input_ids.index(self.assistant_prompt_end_token_id, current_position)
-                
-                # assistant 的实际内容从这个提示符之后开始
-                content_start_index = start_index + 1
-
-                # 2. 寻找 assistant 回答的“结束”边界
-                # 从内容开始的位置，寻找第一个 <|im_end|>
-                end_index = input_ids.index(self.im_end_token_id, content_start_index)
-                
-                # 3. 标记证据
-                # 我们要学习的，就是从 content_start_index 到 end_index (包含) 的所有内容
-                labels[content_start_index : end_index + 1] = input_ids[content_start_index : end_index + 1]
-                
-                # 4. 更新下次搜寻的起点
-                current_position = end_index + 1
-                
-            except ValueError:
-                # 如果找不到更多的 assistant 回答边界，就跳出循环
+            # 1. 寻找 assistant 回答的“开始”边界 (寻找“灯塔”)
+            start_index = -1
+            # 这是一个简单的、用于在列表中查找子列表的循环
+            for i in range(current_position, len(input_ids) - len(self.assistant_prompt_ids) + 1):
+                if input_ids[i : i + len(self.assistant_prompt_ids)] == self.assistant_prompt_ids:
+                    start_index = i
+                    break
+            
+            # 如果找不到更多的“灯塔”，就说明处理完毕，跳出循环
+            if start_index == -1:
                 break
+            
+            # assistant 的实际内容从“灯塔”之后开始
+            content_start_index = start_index + len(self.assistant_prompt_ids)
+
+            # 2. 寻找 assistant 回答的“结束”边界
+            try:
+                end_index = input_ids.index(self.im_end_token_id, content_start_index)
+            except ValueError:
+                # 如果一个 assistant 提示后面没有结束符 (可能因为截断)
+                # 我们就将后面的所有内容都视为需要学习的
+                end_index = len(input_ids) - 1
+
+            # 3. 标记证据
+            labels[content_start_index : end_index + 1] = input_ids[content_start_index : end_index + 1]
+            
+            # 4. 更新下次搜寻的起点
+            current_position = end_index + 1
 
         # 截断
         if len(input_ids) > self.max_length:
