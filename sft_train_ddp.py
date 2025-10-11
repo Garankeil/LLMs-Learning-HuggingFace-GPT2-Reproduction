@@ -60,15 +60,11 @@ model = get_peft_model(model, lora_config)
 model.print_trainable_parameters()
 
 
-# ------------------ 4. 数据集处理 (利用Chat Template的逻辑重构) ------------------
+# ------------------ 4. 数据集处理 (最终修正版) ------------------
 class SFTDataset(Dataset):
     def __init__(self, file_path: str, tokenizer_d, max_length: int = 512):
         self.tokenizer = tokenizer_d
         self.max_length = max_length
-        # 获取特殊token的ID，以便手动构建
-        self.im_start_id = tokenizer_d.bos_token_id
-        self.im_end_id = tokenizer_d.eos_token_id
-
         print(f"Loading data from {file_path}...")
         with open(file_path, 'r', encoding='utf-8') as f:
             self.data = [json.loads(line) for line in f]
@@ -81,32 +77,44 @@ class SFTDataset(Dataset):
         item = self.data[idx]
         conversations = item['conversations']
 
-        input_ids = []
-        labels = []
+        # 第一步：一次性将整个对话历史应用模板，生成完整的 input_ids
+        # 这是确保与模板逻辑完全一致的唯一正确方法
+        full_input_text = self.tokenizer.apply_chat_template(
+            conversations,
+            tokenize=False,
+            add_generation_prompt=False  # 在训练时我们不需要末尾的 assistant 提示
+        )
+        input_ids = self.tokenizer.encode(full_input_text, add_special_tokens=False)
+        
+        # 第二步：初始化 labels，默认所有 token 都不计算损失
+        labels = [-100] * len(input_ids)
 
-        # 使用 apply_chat_template 来获取每一轮的 token ids
-        # 这样可以保证格式的绝对正确性
+        # 第三步：精确定位并标记出 assistant 的回答部分
+        # 我们通过独立编码 assistant 的内容，然后在完整的 input_ids 中查找它
+        current_search_position = 0
         for turn in conversations:
-            # apply_chat_template 需要一个列表作为输入
-            message = [turn]
-            # tokenize=False 先获取格式化后的字符串
-            # add_generation_prompt=False 确保我们得到的是历史记录格式
-            formatted_text = self.tokenizer.apply_chat_template(
-                message,
-                tokenize=False,
-                add_generation_prompt=False
-            )
+            if turn['role'] == 'assistant':
+                # 只编码内容，不加任何特殊 token
+                assistant_content_ids = self.tokenizer.encode(turn['content'], add_special_tokens=False)
+                
+                # 在 input_ids 中查找这段 content_ids 的起始位置
+                # 我们从上一次找到的位置之后开始搜索，以处理多轮对话
+                try:
+                    start_index = input_ids.index(assistant_content_ids[0], current_search_position)
+                    
+                    # 验证这是否是一个真正的匹配
+                    if input_ids[start_index : start_index + len(assistant_content_ids)] == assistant_content_ids:
+                        # 找到了！现在我们用真实的 token_id 替换掉 labels 中对应位置的 -100
+                        labels[start_index : start_index + len(assistant_content_ids)] = assistant_content_ids
+                        
+                        # 更新下一次搜索的起始位置
+                        current_search_position = start_index + len(assistant_content_ids)
 
-            # 编码得到的字符串
-            tokenized_output = self.tokenizer.encode(formatted_text, add_special_tokens=False)
-
-            input_ids.extend(tokenized_output)
-
-            # 根据角色创建 labels
-            if turn['role'] == 'user':
-                labels.extend([-100] * len(tokenized_output))
-            else:  # assistant
-                labels.extend(tokenized_output)
+                except ValueError:
+                    # 如果在 input_ids 中找不到 assistant 的第一个 token，说明数据可能有问题
+                    # 在这里可以添加一些日志或错误处理
+                    # print(f"Warning: Could not find assistant content in input_ids for item {idx}")
+                    pass
 
         # 截断
         if len(input_ids) > self.max_length:
